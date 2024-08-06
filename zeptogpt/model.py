@@ -1,50 +1,40 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-class CausalSelfAttentionHead(nn.Module):
-    def __init__(self, embed_dim, head_size, bias=True):
-        super().__init__()
-        self.head_size = head_size
-        self.query = nn.Linear(embed_dim, head_size, bias)
-        self.key = nn.Linear(embed_dim, head_size, bias)
-        self.value = nn.Linear(embed_dim, head_size, bias)
-
-    def forward(self, inputs): # (B, T, C)
-        B, T, C = inputs.shape
-        q = self.query(inputs) # (B, T, head_size)
-        k = self.key(inputs) # (B, T, head_size)
-        v = self.value(inputs)
-        return CausalSelfAttentionHead.scaled_dot_product_attention(q, k, v, inputs.device)
     
-    def scaled_dot_product_attention(q, k, v, device=None):
-        attn = q @ k.transpose(-2, -1)
-        attn = attn / (q.size(-1) ** 0.5) # Scaled attention
-        causal_mask = torch.tril(torch.ones(attn.shape, device=device))
-        attn = attn.masked_fill(causal_mask == 0, float('-inf')) # Masked attention
-        attn = F.softmax(attn, dim=-1)
-        return attn @ v
-
 class MultiheadedSelfAttention(nn.Module):
-    def __init__(self, embed_dim, num_heads):
+    def __init__(self, embed_dim, num_heads, bias=True):
         super().__init__()
-        self.heads = nn.ModuleList([CausalSelfAttentionHead(embed_dim, embed_dim // num_heads) for _ in range(num_heads)])
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        # key, query, value projections for all heads, but in a batch
+        self.c_attn = nn.Linear(embed_dim, 3 * embed_dim, bias=bias)
+        self.c_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
 
-    def forward(self, inputs): # (B, T, C=embed_dim)
-        outputs = torch.cat([h(inputs) for h in self.heads], dim=-1)
-        return outputs
-
+    def forward(self, x): # (B, T, C=embed_dim)
+        B, T, C = x.shape
+        qkv = self.c_attn(x)
+        q, k, v = qkv.split(self.embed_dim, dim=2)
+        k = k.view(B, T, self.num_heads, C // self.num_heads).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.num_heads, C // self.num_heads).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.num_heads, C // self.num_heads).transpose(1, 2) # (B, nh, T, hs)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        # output projection
+        y = self.c_proj(y)
+        return y
+    
 class DecoderBlock(nn.Module):
     def __init__(self, embed_dim, num_heads):
         super().__init__()
-        self.multi_headed_attn = MultiheadedSelfAttention(embed_dim, num_heads)
-        self.feed_forward = nn.Sequential(nn.Linear(embed_dim, 4*embed_dim), nn.ReLU(), nn.Linear(4*embed_dim, embed_dim), nn.Dropout())
         self.ln1 = nn.LayerNorm(embed_dim)
+        self.attn = MultiheadedSelfAttention(embed_dim, num_heads)
         self.ln2 = nn.LayerNorm(embed_dim)
+        self.mlp = nn.Sequential(nn.Linear(embed_dim, 4*embed_dim), nn.GELU(approximate='tanh'), nn.Linear(4*embed_dim, embed_dim), nn.Dropout())
     
     def forward(self, inputs):
-        outs = inputs + self.multi_headed_attn(self.ln1(inputs))
-        outs = outs + self.feed_forward(self.ln2(outs))
+        outs = inputs + self.attn(self.ln1(inputs))
+        outs = outs + self.mlp(self.ln2(outs))
         return outs
 
 class SimpleGPT(nn.Module):
@@ -54,7 +44,8 @@ class SimpleGPT(nn.Module):
         self.tok_emb_table = nn.Embedding(vocab_size, embed_dim)
         self.pos_emb_table = nn.Embedding(block_size, embed_dim)
         self.decoder_blocks = nn.Sequential(*[DecoderBlock(embed_dim, num_heads) for _ in range(num_decoder_layers)])
-        self.lm_head = nn.Linear(embed_dim, vocab_size)
+        self.ln_f = nn.LayerNorm(embed_dim)
+        self.lm_head = nn.Linear(embed_dim, vocab_size, bias=False)
     
     def forward(self, inputs): # inputs: (B, T)
         B, T = inputs.shape
@@ -62,6 +53,7 @@ class SimpleGPT(nn.Module):
         pos_embed = self.pos_emb_table(torch.arange(T, device=inputs.device)) # (T, C=embed_dim)
         x = tok_embed + pos_embed  # (B, T, C)
         x = self.decoder_blocks(x)
+        x = self.ln_f(x)
         logits = self.lm_head(x) # (B, T, C) -> (B, T, vocab_size)
         return logits
     
@@ -69,10 +61,7 @@ class SimpleGPT(nn.Module):
     def generate(self, context, num_tokens): # context: (1, T)
         for _ in range(num_tokens):
             logits = self(context[:, -self.block_size:])[:,-1,:]
-            probs = F.softmax(logits, dim=1)
+            probs = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
             context = torch.cat((context, next_token), dim=1)
         return context
-
-sample_model = SimpleGPT(1000, 32, 8, 4, 2)
-print(sample_model.generate(torch.zeros((1,1), dtype=torch.long), 10)[0].tolist())
