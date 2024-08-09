@@ -65,3 +65,68 @@ class SimpleGPT(nn.Module):
             next_token = torch.multinomial(probs, num_samples=1)
             context = torch.cat((context, next_token), dim=1)
         return context
+
+import jax
+import flax.linen as nn
+import jax.numpy as jnp
+
+class MultiheadedSelfAttention(nn.Module):
+    n_embed: int
+    n_heads: int
+
+    @nn.compact
+    def __call__(self, x): # (B, T, C=embed_dim)
+        B, T, C = x.shape
+        # key, query, value projections for all heads, but in a batch
+        qkv = nn.Dense(3 * self.n_embed, name='c_attn')(x)
+        q, k, v = jnp.array_split(qkv, 3, axis=-1)
+        q = q.reshape(B, T, self.n_heads, C // self.n_heads).swapaxes(1, 2) # (B, nh, T, hs)
+        k = k.reshape(B, T, self.n_heads, C // self.n_heads).swapaxes(1, 2) # (B, nh, T, hs)
+        v = v.reshape(B, T, self.n_heads, C // self.n_heads).swapaxes(1, 2) # (B, nh, T, hs)
+
+        # y = nn.dot_product_attention(q, k, v, nn.make_causal_mask(jnp.ones((B, T))), deterministic=True) # flash attention
+        att = (q @ k.swapaxes(-2, -1)) * (1.0 / jnp.sqrt(k.shape[-1]))
+        mask = jnp.tril(jnp.ones((T, T))).reshape((1, 1, T, T))
+        att = jnp.where(mask == 0, float('-inf'), att)
+        att = nn.softmax(att, axis=-1)
+        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
+        y = y.reshape(B, T, C) # re-assemble all head outputs side by side
+        # output projection
+        y = nn.Dense(self.n_embed, name='c_proj')(y)
+        return y
+
+class DecoderBlock(nn.Module):
+    n_embed: int
+    n_heads: int
+
+    @nn.compact
+    def __call__(self, x):
+        x = x + MultiheadedSelfAttention(self.n_embed, self.n_heads, name='attn')(nn.LayerNorm(name='ln1')(x))
+        x = x + nn.Sequential([nn.Dense(4 * self.n_embed, name='c_fc'), nn.gelu, nn.Dense(self.n_embed, name='c_proj')], name='mlp')(nn.LayerNorm(name='ln2')(x))
+        return x
+
+class GPT(nn.Module):
+    vocab_size: int
+    block_size: int
+    n_embed: int
+    n_heads: int
+    n_decoders: int
+
+    @nn.compact
+    def __call__(self, x): # x.shape = (B, T)
+        B, T = x.shape
+        tok_embed = nn.Embed(self.vocab_size, self.n_embed, name='tok_embed')(x)
+        pos_embed = nn.Embed(self.block_size, self.n_embed, name='pos_embed')(jnp.arange(0, T))
+        x = tok_embed + pos_embed # (B, T, n_embed)
+        x = nn.Sequential([DecoderBlock(self.n_embed, self.n_heads, name='decoder_' + str(i)) for i in range(self.n_decoders)], name='decoder_blocks')(x)
+        x = nn.Dense(self.vocab_size, name='lm_head')(x) # (B, T, vocab_size)
+        return x
+    
+    def generate(self, key, params, context, max_tokens): # context.shape = (B, T)
+        B, T = context.shape
+        for _ in range(max_tokens):
+            logits = self.apply(params, context[:, :self.block_size])[:,-1,:]
+            next_token = jax.random.categorical(key, logits).reshape(B, -1)
+            context = jnp.concat([context, next_token], axis=1)
+        return context
