@@ -1,4 +1,4 @@
-from zeptogpt.model import MultiheadedSelfAttention, GPT
+from zeptogpt.gpt_jax import MultiheadedSelfAttention, GPT
 
 import jax
 import jax.numpy as jnp
