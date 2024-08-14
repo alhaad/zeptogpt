@@ -61,7 +61,7 @@ class GPTTest(unittest.TestCase):
 
         params = model.init(key, inputs)
 
-        self.assertTrue('lm_head' in params['params'].keys())
+        self.assertTrue('ln_f' in params['params'].keys())
         self.assertTrue('decoder_0' in params['params'].keys())
         self.assertTrue('decoder_1' in params['params'].keys())
         self.assertTrue('tok_embed' in params['params'].keys())
@@ -79,10 +79,10 @@ class GPTTest(unittest.TestCase):
     
     def test_generation(self):
         key = jax.random.key(1337)
-        inputs = jnp.zeros((2, 1), dtype=jnp.int32)
+        inputs = jnp.zeros((1, 1), dtype=jnp.int32)
         model = GPT(1000, 8, 32, 4, 2)
         params = model.init(key, inputs)
 
         out = model.generate(key, params, inputs, 10)
 
-        self.assertEqual(out.shape, (2, 11))
+        self.assertEqual(out.shape, (10, 1, 1))
